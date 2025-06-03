@@ -1,6 +1,7 @@
 # Optimized Join Pipeline - SIGMOD Programming Contest 2025
 
-Implementation of a cache-efficient, multithreaded, lock-free, hash-based join pipeline utilizing a memory-efficient hash table optimized for joins. This project was created for the SIGMOD 2025 Programming Competition, where our undergraduate team achieved 4th place globally! Our implementation achieves a 630x speedup over the organizers' reference solution.
+Implementation of a cache-efficient, multithreaded, lock-free, hash-based join pipeline utilizing a memory-efficient hash table optimized for joins. This project was created for the [SIGMOD 2025 Programming Competition](https://sigmod-contest-2025.github.io/index.html),
+where our undergraduate team achieved 4th place globally! Our implementation achieves a 630x speedup over the organizers' reference solution.
 
 ## Contents
 - [Optimized Join Pipeline - SIGMOD Programming Contest 2025](#optimized-join-pipeline---sigmod-programming-contest-2025)
