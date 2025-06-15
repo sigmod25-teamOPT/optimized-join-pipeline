@@ -1,10 +1,9 @@
-# Optimized Join Pipeline - SIGMOD Programming Contest 2025
+# A Lock-Free Cache-Aware Pipeline for High Throughput Joins - SIGMOD 2025 Programming Contest
 
-Implementation of a cache-efficient, multithreaded, lock-free, hash-based join pipeline utilizing a memory-efficient hash table optimized for joins. This project was created for the [SIGMOD 2025 Programming Competition](https://sigmod-contest-2025.github.io/index.html),
-where our undergraduate team achieved 4th place globally! Our implementation achieves a 630x speedup over the organizers' reference solution.
+Implementation of a cache-efficient, multithreaded, lock-free, hash-based join pipeline utilizing a memory-efficient hash table optimized for joins. This project was created for the [SIGMOD 2025 Programming Competition](https://sigmod-contest-2025.github.io/index.html), where our undergraduate team achieved 4th place globally! Our implementation achieves a 630x speedup over the organizers' reference solution.
 
 ## Contents
-- [Optimized Join Pipeline - SIGMOD Programming Contest 2025](#optimized-join-pipeline---sigmod-programming-contest-2025)
+- [A Lock-Free Cache-Aware Pipeline for High Throughput Joins - SIGMOD 2025 Programming Contest](#a-lock-free-cache-aware-pipeline-for-high-throughput-joins---sigmod-2025-programming-contest)
   - [Contents](#contents)
   - [Our Team](#our-team)
   - [Preparation](#preparation)
@@ -13,8 +12,8 @@ where our undergraduate team achieved 4th place globally! Our implementation ach
   - [Task Overview](#task-overview)
   - [Implementation Details](#implementation-details)
     - [Loading and Preprocessing](#loading-and-preprocessing)
-    - [Join Data Flow \& Materialization](#join-data-flow--materialization)
     - [Unchained Hash Table](#unchained-hash-table)
+    - [Join Data Flow \& Materialization](#join-data-flow--materialization)
     - [Parallel Data Processing](#parallel-data-processing)
     - [Pipeline](#pipeline)
   - [References](#references)
@@ -80,6 +79,9 @@ Run individual queries (e.g. queries `1a` and `1b`) using:
 - Input Data provided as in-memory, column-store, paginated tables. Produced output follows the same format.
 - Join Execution Plan provided and optimized by PostgreSQL as a directed tree of Scan Nodes - representing input tables - and Join Nodes.
 - Joins are performed only on integer fields, while Doubles and Strings can also appear in the result. Attributes can have null values.
+- Example of a Join Plan:
+
+![Join Plan Example](images/Diagram1.png)
 
 ## Implementation Details
 
@@ -95,39 +97,43 @@ Run individual queries (e.g. queries `1a` and `1b`) using:
 - 99+% of columns never have to be loaded or are processed in the background, thereby approximating a completely **zero-copy** solution!
 - Do not spend any time collecting stats in an attempt to beat Postgres’ plan optimizer.
 
+### Unchained Hash Table
+
+- Hash table optimized for joins [[1]](#references).
+- Since inserts and lookups are not mixed, separate building and probing into distinct phases.
+- Partition Data among workers to parallelize building.
+- All the entries of the table live in one large **contiguous** block, massively improving cache locality.
+- Use of `CRC` hardware instruction instead of off-the-shelf hash functions to hash in only a few cycles while maintaining adequate collision resistance.
+- Built-in **bloom filter** in the lower 16-bits of directory pointer and use of precalculated tags for containment check.
+
+![Unchained Hash Table](images/Diagram3.png)
+
 ### Join Data Flow & Materialization
 
-- Late Record Materialization to eliminate unnecessary data copies to reduce cache pollution.
+- **Late Record Materialization** to eliminate unnecessary data copies to reduce cache pollution.
 - Each join materializes the column needed for the next join in the pipeline to improve memory access patterns.
 - Joins at the root of the tree materilaze the final output.
 
-### Unchained Hash Table
-
-- Hash table optimized for join [1].
-- Since inserts and lookups are not mixed, separate building and probing into distinct phases.
-- Partition Data among workers to parallelize building.
-- All the entries inserted to the table live in one large contiguous block, massively improving cache locality.
-- Use of CRC hardware instruction instead of off-the-shelf hash functions to hash in only a few cycles while maintaining adequate collision resistance.
-- Built-in bloom filter in the lower 16-bits of directory pointer and use of precalculated tags for containment check.
+![Join Data Flow](images/Diagram2.png)
 
 ### Parallel Data Processing
 
 - Implement a Priority-Based Task Queue that dynamically assigns tasks on available hardware threads.
 - Prioritize tasks that enable processing of interdependent joins.
-- Morsel-driven Parallelism [2]: break down heavier jobs into self-contained tasks, each responsible for independently processing a smaller chunk of the data.
-- Implement a lock-free chunk feeder mechanism to efficiently handle skew: tasks that finish early can dynamically “steal” pages from other tasks to balance workload.
-- Each task independently produces paginated results and deposits them in dedicated per-worker slots without incurring any synchronization cost.
+- *Morsel-driven Parallelism* [[2]](#references): break down heavier jobs into self-contained tasks, each responsible for independently processing a smaller chunk of the data.
+- Implement a **lock-free** chunk feeder mechanism to efficiently handle skew: tasks that finish early can dynamically **“steal”** pages from other tasks to balance workload.
+- Each task **independently** produces paginated results and deposits them in dedicated **per-worker slots** without incurring any synchronization cost.
 - Dynamic Job Batching for very small tasks to reduce overhead.
 - Eliminate false sharing by properly aligning concurrently accessed data structures.
 
 ### Pipeline
 
 - Intermediate results are chunked and immediately forwarded so the next join in the pipeline can also progress while the data are still hot in CPU’s Caches.
-- Completely lock-free pipeline implemented using atomic instructions to minimize synchronization overhead and enable finer granularity tasks.
+- Completely **lock-free** pipeline implemented using atomic instructions to minimize synchronization overhead and enable finer granularity tasks.
 - Every completed task executes part of the pipeline control logic - appropriately advancing pipeline state and kickstarting tasks for next stages or joins.
 - Schedule further processing of the data to the same hardware thread that produced it - optimizing cache efficiency.
 
 ## References
 
-[1]: [Simple, Efficient, and Robust Hash Tables for Join Processing](https://db.in.tum.de/~birler/papers/hashtable.pdf)
-[2]: [Morsel-Driven Parallelism: A NUMA-Aware Query Evaluation Framework for the Many-Core Age](https://db.in.tum.de/~leis/papers/morsels.pdf)
+1. [Simple, Efficient, and Robust Hash Tables for Join Processing](https://db.in.tum.de/~birler/papers/hashtable.pdf)
+2. [Morsel-Driven Parallelism: A NUMA-Aware Query Evaluation Framework for the Many-Core Age](https://db.in.tum.de/~leis/papers/morsels.pdf)
