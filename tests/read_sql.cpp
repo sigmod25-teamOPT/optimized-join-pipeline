@@ -1,3 +1,7 @@
+#ifdef TEAMOPT_BUILD_CACHE
+#include <iostream>
+#endif
+
 #include <array>
 #include <fstream>
 #include <memory>
@@ -6,7 +10,6 @@
 
 #include <inner_column.h>
 #include <plan.h>
-#include <table.h>
 #include <table_entity.h>
 
 #include <fmt/core.h>
@@ -14,7 +17,11 @@
 
 #include <SQLParser.h>
 
+#ifdef TEAMOPT_USE_DUCKDB
 #include <duckdb.hpp>
+#endif
+
+#include <table.h>
 
 using json = nlohmann::json;
 
@@ -858,7 +865,8 @@ struct ParsedSQL {
     }
 };
 
-Plan load_join_pipeline(const json& node, const ParsedSQL& parsed_sql) {
+Plan load_join_pipeline(const json& node, const ParsedSQL& parsed_sql,
+        const std::string& query_name) {
     namespace fs = std::filesystem;
     static std::unordered_set<std::string_view> other_operators{"Aggregate", "Gather"};
     static std::unordered_set<std::string_view> join_types{"Nested Loop",
@@ -916,10 +924,13 @@ Plan load_join_pipeline(const json& node, const ParsedSQL& parsed_sql) {
                        &table_counts = parsed_sql.table_counts,
                        &alias_map    = parsed_sql.alias_map,
                        &join_graph   = parsed_sql.join_graph,
-                       &filters      = parsed_sql.filters](auto&& recurse,
+                       &filters      = parsed_sql.filters,
+                       &query_name
+                    ](auto&& recurse,
                        const json& node,
                        const OutputAttrsType& required_attrs)
         -> std::tuple<size_t, std::vector<std::tuple<TableEntity, std::string, DataType>>> {
+
         auto node_type = node["Node Type"].get<std::string_view>();
 
         if (auto itr = other_operators.find(node_type); itr != other_operators.end()) {
@@ -1101,11 +1112,51 @@ Plan load_join_pipeline(const json& node, const ParsedSQL& parsed_sql) {
             if (auto itr = filters.find(entity); itr != filters.end()) {
                 filter = itr->second.get();
             }
-            auto table        = Table::from_csv(*pattributes,
-                fs::path("imdb") / fmt::format("{}.csv", entity.table),
-                filter);
+
+#ifdef TEAMOPT_BUILD_CACHE
+            /* The following code will just dump the table to cache and exit */
+
+            /* Check if dir exists */
+            if (!fs::exists(fs::path("cache"))) {
+                fs::create_directory("cache");
+            }
+
+            /* Cache file */
+            std::string fil_str = filter ? filter->pretty_print() : "No filter";
+            uint64_t fnvhash = FNVHash::hash(fil_str.data(), fil_str.size());
+            std::string filename = "cache/" + entity.table + fmt::format("_{}.tbl", fnvhash);
+
+            /* Dump file if its never seen before */
+            uint64_t new_input_id;
+            if (!fs::exists(fs::path(filename))) {
+                auto table = Table::from_csv(*pattributes,
+                    fs::path("imdb") / fmt::format("{}.csv", entity.table),
+                    filter);
+
+                std::cout << "Dumping table to cache: " << filename << std::endl;
+                DumpTable dump_table(&table);
+                /* Dump table to cache */
+                std::ofstream newtbl(filename, std::ios::binary);
+                dump_table.dump(newtbl);
+                new_input_id = ret.new_input(std::move(table));
+            } else std::cout << "Table already in cache: " << filename << std::endl;
+
+#elif defined TEAMOPT_USE_DUCKDB
+            auto table = Table::from_csv(*pattributes,
+                        fs::path("imdb") / fmt::format("{}.csv", entity.table),
+                        filter);
             auto new_input_id = ret.new_input(std::move(table));
-            // auto new_input_id = ret.new_table(std::move(table));
+#else /* Use cache */
+            std::string fil_str = filter ? filter->pretty_print() : "No filter";
+            uint64_t fnvhash = FNVHash::hash(fil_str.data(), fil_str.size());
+            std::string filename = "cache/" + entity.table + fmt::format("_{}.tbl", fnvhash);
+            if (!fs::exists(fs::path(filename))) {
+                throw std::runtime_error(
+                    fmt::format("Table file does not exist: {}", filename));
+            }
+            auto table = Table::from_cache(fs::path(filename));
+            auto new_input_id = ret.new_input(std::move(table));
+#endif
             std::vector<std::tuple<TableEntity, std::string, DataType>> output_columns;
             std::vector<std::tuple<size_t, DataType>>                   output_attrs;
             for (const auto& [required_entity, required_column]: required_attrs) {
@@ -1140,6 +1191,11 @@ Plan load_join_pipeline(const json& node, const ParsedSQL& parsed_sql) {
     return ret;
 }
 
+void sort(std::vector<std::vector<Data>>& table) {
+    std::sort(table.begin(), table.end());
+}
+
+#ifdef TEAMOPT_USE_DUCKDB
 bool equal(const duckdb::LogicalType& lhs, DataType rhs) {
     using namespace duckdb;
     switch (lhs.id()) {
@@ -1150,10 +1206,6 @@ bool equal(const duckdb::LogicalType& lhs, DataType rhs) {
     default:
         throw std::runtime_error(fmt::format("{} in DuckDB is not supported", lhs.ToString()));
     }
-}
-
-void sort(std::vector<std::vector<Data>>& table) {
-    std::sort(table.begin(), table.end());
 }
 
 bool compare(duckdb::MaterializedQueryResult& duckdb_results, const ColumnarTable& results) {
@@ -1213,6 +1265,49 @@ bool compare(duckdb::MaterializedQueryResult& duckdb_results, const ColumnarTabl
         }
     };
     filter_tp.run(task, num_rows);
+
+    for (auto v: booleans) {
+        if (not v) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
+bool compare_withcache(const ColumnarTable& expected, const ColumnarTable& results) {
+    auto num_rows = results.num_rows;
+    auto num_cols = results.columns.size();
+    if (expected.num_rows != num_rows) {
+        fmt::println("Row count mismatch: expected {}, got {}", expected.num_rows, num_rows);
+        return false;
+    }
+    if (expected.columns.size() != num_cols) {
+        fmt::println("Column count mismatch: expected {}, got {}", expected.columns.size(), num_cols);
+        return false;
+    }
+    for (size_t i = 0; i < num_cols; ++i) {
+        if (expected.columns[i].type != results.columns[i].type) {
+            fmt::println("Column type mismatch at column {}: expected {}, got {}",
+                i,
+                (size_t)expected.columns[i].type,
+                (size_t)results.columns[i].type);
+            return false;
+        }
+    }
+
+    auto results_table = Table::from_columnar(results);
+    auto expected_table = Table::from_columnar(expected);
+    sort(results_table.table());
+
+    std::vector<uint8_t> booleans(num_rows, 0);
+    auto task = [&](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i) {
+            booleans[i] = uint8_t(results_table.table()[i] == expected_table.table()[i]);
+        }
+    };
+    filter_tp.run(task, num_rows);
+
     for (auto v: booleans) {
         if (not v) {
             return false;
@@ -1225,27 +1320,62 @@ std::pair<bool, size_t> run(const std::unordered_map<std::string, std::vector<st
     std::string_view                                                      name,
     std::string                                                           sql,
     const json&                                                           plan_json,
+#ifdef TEAMOPT_USE_DUCKDB
     duckdb::Connection&                                                   conn,
+#endif
     [[maybe_unused]] void*                                                context) {
     ParsedSQL parsed_sql(column_to_tables);
     parsed_sql.parse_sql(sql, name);
-    auto plan = load_join_pipeline(plan_json["Plan"], parsed_sql);
+
+    auto plan = load_join_pipeline(plan_json["Plan"], parsed_sql, std::string{name});
 
     auto start   = std::chrono::steady_clock::now();
+#ifndef TEAMOPT_BUILD_CACHE
     auto results = Contest::execute(plan, context);
+#endif
     auto end     = std::chrono::steady_clock::now();
 
+#ifdef TEAMOPT_USE_DUCKDB
     auto executed_sql = parsed_sql.executed_sql(sql);
-    // fmt::println("{}", executed_sql);
-    auto       result = conn.Query(executed_sql);
+    auto result = conn.Query(executed_sql);
 
-    const auto compare_result = compare(*result, results);
+#ifdef TEAMOPT_BUILD_CACHE
+    std::string filename = "cache/" + std::string(name) + ".tbl";
+    namespace fs = std::filesystem;
+    if (!fs::exists(fs::path(filename))) {
+        fmt::println("Dump result: {}\n", filename);
+        DumpTable dump_table(*result);
+        /* Dump table to cache */
+        std::ofstream newtbl(filename, std::ios::binary);
+        dump_table.dump(newtbl);
+    } else fmt::println("Table already in cache: {}\n", filename);
+#endif
+
+#endif
+
+    auto compare_result = true;
+
+#ifndef TEAMOPT_BUILD_CACHE
+
+#ifdef TEAMOPT_USE_DUCKDB
+    compare_result = compare(*result, results);
+#else /* Compare using cache */
+    std::string filename = "cache/" + std::string(name) + ".tbl";
+    namespace fs = std::filesystem;
+    if (!fs::exists(fs::path(filename)))
+        throw std::runtime_error(
+            fmt::format("Table file does not exist: {}", filename));
+    auto expected = Table::from_cache(fs::path(filename));
+    compare_result = compare_withcache(expected, results);
+#endif
+
     fmt::println("Query {} >> \t\t Runtime: {} ms - Result correct: {}",
         name,
         std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count(),
         compare_result);
-   
-    return {compare_result, std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()};
+#endif
+
+    return {compare_result, std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count()};
 }
 
 int main(int argc, char* argv[]) {
@@ -1258,7 +1388,7 @@ int main(int argc, char* argv[]) {
             // case we write the runtime result to this file.
             fmt::println(stderr, "{} <path to plans> [<name of selected sql>] [{}]", argv[0], output_filename);
         }
-  
+
         // column to table map
         std::unordered_map<std::string, std::vector<std::string>> column_to_tables;
 
@@ -1300,21 +1430,29 @@ int main(int argc, char* argv[]) {
         auto sql_directory = query_plans["sql_directory"].get<std::string>();
         auto names         = query_plans["names"].get<std::vector<std::string>>();
         auto plans         = query_plans["plans"];
-  
+
         auto all_queries_succeeded = true;
+#ifdef TEAMOPT_USE_DUCKDB
         using namespace duckdb;
         DuckDB     db("imdb.db");
         Connection conn(db);
+#endif
         for (const auto& [name, plan_json]: views::zip(names, plans)) {
             if ((argc < 3 || (selected_plans.find(name) != selected_plans.end())) ||
                 (argc == 3 && std::string{argv[2]} == output_filename)) {
                 auto sql_path = fs::path(sql_directory) / fmt::format("{}.sql", name);
-                auto sql      = read_file(sql_path);
+                auto sql = read_file(sql_path);
+#ifdef TEAMOPT_USE_DUCKDB
                 const auto [result_is_correct, query_runtime] = run(column_to_tables, name, std::move(sql), plan_json, conn, context);
+#else
+                const auto [result_is_correct, query_runtime] = run(column_to_tables, name, std::move(sql), plan_json, context);
+#endif
                 runtime += query_runtime;
                 all_queries_succeeded &= result_is_correct;
             }
         }
+        fmt::println("Total runtime: {} ms", runtime);
+        fmt::println("All queries succeeded: {}", all_queries_succeeded ? "Yes" : "No");
 
         if (all_queries_succeeded && write_output_file) {
             auto output_file = std::ofstream(output_filename);

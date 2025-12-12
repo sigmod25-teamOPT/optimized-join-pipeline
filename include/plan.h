@@ -20,6 +20,52 @@
 
 #include <attribute.h>
 #include <statement.h>
+
+#if !defined(TEAMOPT_USE_DUCKDB) || defined(TEAMOPT_BUILD_CACHE)
+#include <sys/mman.h>
+#endif
+
+class MappedMemory {
+    public:
+    void*  addr;
+    size_t length;
+    size_t refs;
+    MappedMemory(void* addr, size_t length)
+    : addr(addr)
+    , length(length)
+    , refs(0) {}
+
+    MappedMemory(const MappedMemory&) = delete;
+    MappedMemory& operator=(const MappedMemory&) = delete;
+
+    MappedMemory(MappedMemory&& other) noexcept
+    : addr(other.addr)
+    , length(other.length)
+    , refs(other.refs) {
+        other.addr = nullptr;
+        other.length = 0;
+        other.refs = 0;
+    }
+
+    MappedMemory& operator=(MappedMemory&& other) noexcept {
+        if (this != &other) {
+            addr = other.addr;
+            length = other.length;
+            refs = other.refs;
+            other.addr = nullptr;
+            other.length = 0;
+            other.refs = 0;
+        }
+        return *this;
+    }
+
+    ~MappedMemory() {
+#if !defined(TEAMOPT_USE_DUCKDB) || defined(TEAMOPT_BUILD_CACHE)
+        munmap(addr, length);
+#endif
+    }
+};
+
 // #include <table.h>
 
 // supported attribute data types
@@ -60,6 +106,7 @@ struct alignas(8) Page {
 struct Column {
     DataType           type;
     std::vector<Page*> pages;
+    MappedMemory      *mapped_memory;
 
     Page* new_page() {
         auto ret = new Page;
@@ -67,14 +114,21 @@ struct Column {
         return ret;
     }
 
+    void assign_mapped_memory(MappedMemory* mapped_memory) {
+        this->mapped_memory = mapped_memory;
+        this->mapped_memory->refs++;
+    }
+
     Column(DataType data_type)
     : type(data_type)
-    , pages() {}
+    , pages(), mapped_memory(nullptr) {}
 
     Column(Column&& other) noexcept
     : type(other.type)
-    , pages(std::move(other.pages)) {
+    , pages(std::move(other.pages))
+    , mapped_memory(other.mapped_memory) {
         other.pages.clear();
+        other.mapped_memory = nullptr;
     }
 
     Column& operator=(Column&& other) noexcept {
@@ -85,6 +139,8 @@ struct Column {
             type  = other.type;
             pages = std::move(other.pages);
             other.pages.clear();
+            mapped_memory = other.mapped_memory;
+            other.mapped_memory = nullptr;
         }
         return *this;
     }
@@ -93,6 +149,11 @@ struct Column {
     Column& operator=(const Column&) = delete;
 
     ~Column() {
+        if (mapped_memory != nullptr) {
+            if (--mapped_memory->refs == 0)
+                delete mapped_memory;
+            return;
+        }
         for (auto* page: pages) {
             delete page;
         }
